@@ -10,18 +10,39 @@ Kronos is an OSRS (Old School RuneScape) private game server. It is a Java 21 mu
 |---|---|---|---|
 | `kronos-server` | 13302 | **Yes** | Main game server, primary target |
 | `kronos-update-server` | 7304 | **Yes** | Cache update server, separate container |
-| `kronos-webhooks` | - | **Yes** | Discord integration, separate container |
+| `kronos-webhooks` | - | **Maybe** | Discord integration, future candidate |
 | `runelite` (client) | - | **No** | Desktop GUI app, not suitable |
 | `kronos-launcher` | - | **No** | Client launcher, not a server |
-| `Kronos-web` (PHP) | - | **Maybe** | Simple PHP scripts, could use nginx+php-fpm |
+| `Kronos-web` (PHP) | - | **Maybe** | Simple PHP scripts, future candidate |
+
+## Container Architecture
+
+Both server containers are built in the [docker-containers](https://github.com/shockstruck/docker-containers) repository following standardized build patterns:
+
+```
+docker-containers/apps/
+  kronos-server/
+    Dockerfile          # Multi-stage JDK 21 build
+    docker-bake.hcl     # Version pinning and OCI labels
+    tests.yaml          # Container structure tests
+  kronos-update-server/
+    Dockerfile          # Multi-stage JDK 21 build
+    docker-bake.hcl     # Version pinning and OCI labels
+    tests.yaml          # Container structure tests
+```
+
+Published to:
+- `ghcr.io/shockstruck/kronos-server:184.0`
+- `ghcr.io/shockstruck/kronos-update-server:184.0`
 
 ## Build Requirements
 
-- **Base image**: `eclipse-temurin:21-jre-alpine` (runtime)
-- **Build stage**: JDK 21 + Gradle 8.14 (multi-stage build)
-- **Build command**: `./gradlew :kronos-server:distZip`
+- **Build stage**: `eclipse-temurin:21.0.10_7-jdk-alpine` (Gradle compilation)
+- **Runtime stage**: `alpine:3.23` with `openjdk21-jre-headless`
+- **Init system**: tini (Alpine native)
+- **Build command**: `./gradlew :kronos-server:distZip` / `./gradlew :kronos-update-server:distZip`
 - **Source/target compatibility**: Java 21, Kotlin JVM 21
-- **Gradle wrapper**: Included in repo (`gradlew`), build stage is self-contained
+- **Gradle wrapper**: Included in repo, build stage is self-contained
 
 ## Runtime Dependencies
 
@@ -36,16 +57,18 @@ Kronos is an OSRS (Old School RuneScape) private game server. It is a Java 21 mu
 
 - Binary `.dat2` and `.idx` files located in `Cache/` directory.
 - These files are large (potentially 1GB+). Do **not** bake them into the Docker image.
-- Mount as a volume or use an init container to populate them.
+- Mount as a volume at `/cache`.
 
 ### Player Save Data
 
 - In DEV mode, player saves are stored as local files under the `Data/` directory.
-- Requires a persistent volume to survive container restarts.
+- Requires a persistent volume mounted at `/data`.
 
 ## Configuration
 
-The server reads `server.properties` at startup. Example values from `server.example.properties`:
+The server reads `server.properties` at startup. Mount your config file to `/config/server.properties`.
+
+Example values from `server.example.properties`:
 
 ```properties
 cache_path=../Cache
@@ -65,70 +88,46 @@ database_user=<user>
 database_password=<password>
 ```
 
-For containerization, these values should be configurable via:
+## Volume Mounts
 
-- Environment variables injected through an entrypoint script
-- A mounted config file at a known path
+| Mount Point | Purpose | Mode |
+|---|---|---|
+| `/config` | Server properties and configuration | read-only |
+| `/data` | Player save data | read-write |
+| `/cache` | Game cache files (`.dat2`, `.idx`) | read-only |
 
-## Challenges
+## Container Security
 
-### 1. Relative Path References
+- Non-root execution: runs as `kronos` user (UID 1001)
+- Multi-stage build: JDK build tools excluded from runtime image
+- Alpine base: minimal attack surface
+- tini init: proper PID 1 signal handling
+- Health check: process-based liveness check
+- OCI labels: full metadata for registry compliance
 
-The config uses `cache_path=../Cache` (parent directory). The container working directory and file layout must match this expectation.
+## Deployment
 
-**Solution**: Structure the container as:
+### Quick Start (DEV mode, no database)
 
+```bash
+docker run -d \
+  --name kronos-server \
+  -p 13302:13302 \
+  -v ./cache:/cache:ro \
+  -v ./data:/data \
+  -v ./config:/config:ro \
+  ghcr.io/shockstruck/kronos-server:184.0
 ```
-/app/
-  Cache/          <- mounted volume
-  server/
-    bin/           <- gradle distZip output
-    lib/           <- gradle distZip output
-    Data/          <- mounted volume
-    server.properties
-```
 
-Set the working directory to `/app/server/` so `../Cache` resolves to `/app/Cache/`.
+### With Update Server
 
-### 2. Large Binary Cache Files
-
-The `Cache/` directory contains binary game assets that should not be included in the Docker image layer.
-
-**Solution**: Use a Docker volume mount. Populate the cache before first run, either manually or via an init container.
-
-### 3. State Persistence
-
-Player data in `Data/` must persist across container restarts.
-
-**Solution**: Mount `Data/` as a persistent volume.
-
-### 4. Database Connectivity
-
-In LIVE mode, the server needs MySQL access.
-
-**Solution**: Use a `docker-compose.yml` or Kubernetes deployment with a MySQL sidecar. Pass connection details via environment variables.
-
-## Recommended Architecture
-
-```
-+-----------------------+     +------------------------+
-|  kronos-server        |---->|  MySQL/MariaDB          |
-|  (JDK 21 Alpine)      |     |  (optional, LIVE only)  |
-|  Port: 13302          |     +------------------------+
-+-----------------------+
-        |
-   Volumes:
-     /app/Cache    (game cache, read-only)
-     /app/server/Data  (player saves, read-write)
-     /app/server/server.properties (config, read-only)
-
-+-----------------------+
-|  kronos-update-server |
-|  Port: 7304           |
-+-----------------------+
-        |
-   Volumes:
-     /app/Cache    (shared with game server)
+```bash
+docker run -d \
+  --name kronos-update-server \
+  -p 7304:7304 \
+  -v ./cache:/cache:ro \
+  -v ./config:/config:ro \
+  ghcr.io/shockstruck/kronos-update-server:184.0
 ```
 
 ## Feasibility Summary
@@ -141,11 +140,3 @@ In LIVE mode, the server needs MySQL access.
 | Network | Simple | Single TCP port per service |
 | Database | Optional | Not needed in DEV mode |
 | Multi-arch | Easy | JVM runs on any arch with matching JRE |
-
-## Next Steps
-
-1. Create a multi-stage `Dockerfile` for `kronos-server`
-2. Create a `docker-bake.hcl` build definition
-3. Add a `docker-compose.yml` for local development (server + MySQL)
-4. Test the build in DEV mode (no database required)
-5. Validate LIVE mode with MySQL connectivity
